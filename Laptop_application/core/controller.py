@@ -1,55 +1,154 @@
 from PyQt5.QtCore import QObject, pyqtSignal, QTimer
 from enum import Enum, auto
-import math, random
+import math, time, random
+import config
 from core.data_logger import DataLogger
+from core.pid import PID
 
 class State(Enum):
-    PRESTART = auto()
-    GROUSERTEST = auto()
-    RUBBERTEST = auto()
-    LOADTEST = auto()
-    PAUSED = auto()
+    PRESTART     = auto()
+    GROUSERTEST  = auto()
+    RUBBERTEST   = auto()
+    LOADTEST     = auto()
+    PAUSED       = auto()
 
 class Controller(QObject):
-    data_updated = pyqtSignal(list)    # [t, v1, v2, v3]
-    state_changed = pyqtSignal(State)
-    log_message = pyqtSignal(str)      # messages for GUI command window
+    data_updated   = pyqtSignal(list)    # [t, set_len, act_len, output]
+    state_changed  = pyqtSignal(State)
+    log_message    = pyqtSignal(str)      # GUI log messages
 
     def __init__(self, interval: int = 100):
         super().__init__()
-        self.interval = interval
-        self.timer = QTimer(self)
+        # Base interval for state-machine tests
+        self.interval      = interval
+        self.timer         = QTimer(self)
         self.timer.setInterval(self.interval)
         self.timer.timeout.connect(self._on_timeout)
 
-        self.state = State.PRESTART
-        self._sequence = []
-        self._last_test = None
-        self.t = 0.0
-        self.logger = None
+        # State-machine setup
+        self.state         = State.PRESTART
+        self._sequence     = []
+        self._last_test    = None
+        self.t             = 0.0
+        self.logger        = None
 
-        # Handler maps
         self._enter_handlers = {
-            State.PRESTART: self._enter_prestart,
+            State.PRESTART:    self._enter_prestart,
             State.GROUSERTEST: self._enter_grouser,
-            State.RUBBERTEST: self._enter_rubber,
-            State.LOADTEST: self._enter_load,
-            State.PAUSED: self._enter_paused,
+            State.RUBBERTEST:  self._enter_rubber,
+            State.LOADTEST:    self._enter_load,
+            State.PAUSED:      self._enter_paused,
         }
         self._exit_handlers = {
-            State.PRESTART: self._exit_prestart,
+            State.PRESTART:    self._exit_prestart,
             State.GROUSERTEST: self._exit_grouser,
-            State.RUBBERTEST: self._exit_rubber,
-            State.LOADTEST: self._exit_load,
-            State.PAUSED: self._exit_paused,
+            State.RUBBERTEST:  self._exit_rubber,
+            State.LOADTEST:    self._exit_load,
+            State.PAUSED:      self._exit_paused,
         }
         self._update_handlers = {
             State.GROUSERTEST: self._update_grouser,
-            State.RUBBERTEST: self._update_rubber,
-            State.LOADTEST: self._update_load,
+            State.RUBBERTEST:  self._update_rubber,
+            State.LOADTEST:    self._update_load,
         }
 
-    # Public API
+        # Rotation control parameters from config
+        self.rotation_deg   = config.ROTATION_DEG
+        self.rotation_time  = config.ROTATION_TIME
+        self.frequency      = config.CONTROL_FREQUENCY  # Hz
+
+        # Derived rotation timing
+        self.dt_s           = 1.0 / self.frequency
+        self.dt_ms          = int(self.dt_s * 1000)
+        self.omega          = math.radians(self.rotation_deg) / self.rotation_time
+
+        # Precompute rotation trajectory (length setpoints)
+        steps = int(self.rotation_time * self.frequency) + 1
+        self._times       = [i * self.dt_s for i in range(steps)]
+        self._setpoints   = [
+            math.hypot(
+                955.9 + 247.5 * math.sin(self.omega * t),
+                247.5 * math.cos(self.omega * t)
+            ) for t in self._times
+        ]
+
+        # PID for length control
+        self.pid = PID(
+            kp=config.PID_KP,
+            ki=config.PID_KI,
+            kd=config.PID_KD,
+            setpoint=0.0,
+            sample_time=self.dt_s,
+            output_limits=(config.MIN_SPEED, config.MAX_SPEED)
+        )
+
+        # Rotation state flags
+        self._rotation_active = False
+        self._rotation_index  = 0
+
+    # --- Rotation control API ---------------------------------------------
+    def start_rotation(self):
+        """
+        Begin closed-loop rotation: rotate rotation_deg over rotation_time seconds.
+        """
+        self.pid.reset()
+        self._rotation_active = True
+        self._rotation_index  = 0
+        self.t = 0.0
+        # Use rotation timer interval
+        self.timer.setInterval(self.dt_ms)
+        self.timer.start()
+        self.log_message.emit("Rotation started")
+
+    def stop_rotation(self):
+        """
+        Stop rotation and revert to state-machine timing.
+        """
+        self._rotation_active = False
+        self.timer.stop()
+        self.timer.setInterval(self.interval)
+        self.log_message.emit("Rotation stopped")
+
+    # --- Internal timer callback ------------------------------------------
+    def _on_timeout(self):
+        if self._rotation_active:
+            self._update_rotation()
+        else:
+            handler = self._update_handlers.get(self.state)
+            if handler:
+                handler()
+        # Advance elapsed time
+        delta = self.dt_s if self._rotation_active else (self.interval / 1000.0)
+        self.t += delta
+
+    def _update_rotation(self):
+        # Check completion
+        if self._rotation_index >= len(self._setpoints):
+            self.stop_rotation()
+            return
+
+        # Current time and setpoint
+        t        = self._times[self._rotation_index]
+        l_set    = self._setpoints[self._rotation_index]
+        # TODO: implement actual measurement reading
+        l_act    = 0.0
+
+        # PID-only control
+        self.pid.setpoint = l_set
+        corr = self.pid.update(l_act, current_time=time.time())
+        if corr is None:
+            return
+        output = corr
+
+        # Emit data for plotting/log
+        self.data_updated.emit([t, l_set, l_act, output])
+        self.log_message.emit(
+            f"t={t:.2f}s set={l_set:.2f} act={l_act:.2f} -> {output:.2f}"
+        )
+
+        self._rotation_index += 1
+
+    # --- Existing state-machine methods ----------------------------------
     def start_sequence(self, include_grouser: bool):
         seq = []
         if include_grouser:
@@ -70,26 +169,19 @@ class Controller(QObject):
         self._start_next_test()
 
     def reset(self):
-        """
-        Abort sequence and return to PRESTART.
-        """
-        # Stop any running timer
         if self.timer.isActive():
             self.timer.stop()
-        # Close logger if open
         if self.logger:
             self.logger.close()
             self.logger = None
-        # Clear pending tests and reset time
         self._sequence.clear()
         self._last_test = None
         self.t = 0.0
-        # Transition back to PRESTART
+        self._rotation_active = False
+        self._rotation_index = 0
         self._change_state(State.PRESTART)
-        # Explicitly run the PRESTART entry handler
         self._enter_state(State.PRESTART)
 
-    # Internal transitions
     def _start_next_test(self):
         if self._sequence:
             next_state = self._sequence.pop(0)
@@ -119,13 +211,7 @@ class Controller(QObject):
         self.state = new_state
         self.state_changed.emit(self.state)
 
-    def _on_timeout(self):
-        handler = self._update_handlers.get(self.state)
-        if handler:
-            handler()
-        self.t += self.interval / 1000.0
-
-    # State-specific methods
+    # State-specific handlers unchanged...
     def _enter_prestart(self):
         self.log_message.emit("Entering PRESTART: configure winch")
 
@@ -134,10 +220,8 @@ class Controller(QObject):
 
     def _enter_grouser(self):
         self.log_message.emit("Entering GROUSERTEST")
-        # Close previous logger if any
         if self.logger:
             self.logger.close()
-        # Create new logger for this test and report filename
         self.logger = DataLogger(state=self.state)
         self.log_message.emit(f"Logging to {self.logger.filepath}")
 
